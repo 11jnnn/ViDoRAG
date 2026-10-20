@@ -33,7 +33,8 @@ def gmm(recall_result: list[NodeWithScore], input_length: int=20, max_valid_leng
     #-> List[NodeWithScore]:  # 返回：筛选后的节点列表。
     scores = [node.score for node in recall_result[:input_length]]
     
-    scores = np.array(scores)
+    #将列表转数组，便于后续操作
+    scores = np.array(scores)  
     scores = scores.reshape(-1, 1)
     gmm = GaussianMixture(n_components=2, n_init=1,random_state=0)
     gmm.fit(scores)
