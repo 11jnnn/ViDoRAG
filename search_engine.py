@@ -36,10 +36,20 @@ def gmm(recall_result: list[NodeWithScore], input_length: int=20, max_valid_leng
     #将列表转数组，便于后续操作
     scores = np.array(scores)  
     scores = scores.reshape(-1, 1)
-    gmm = GaussianMixture(n_components=2, n_init=1,random_state=0)
+
+      # 创建高斯混合模型。
+    # n_components=2：用两个高斯分布拟合这些分数。
+    # n_init=1：只尝试一组初始化。
+    # random_state=0：固定随机种子，便于重复实验。
+    gmm = GaussianMixture(n_components=2, n_init=1, random_state=0)
+
+    # 根据输入分数，学习两个高斯分布的参数。
     gmm.fit(scores)
+
+    # 判断每个分数更属于哪个分布，返回类别编号。
     labels = gmm.predict(scores)
 
+    #还原score格式
     scores = scores.flatten()
     scores = [scores[labels == label] for label in np.unique(labels)]
     recall_result = [np.array(recall_result[:input_length])[labels == label].tolist() for label in np.unique(labels)]
