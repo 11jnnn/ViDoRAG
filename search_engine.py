@@ -20,17 +20,17 @@ from utils.format_converter import nodefile2node,nodes2dict
 
 def gmm(recall_result: list[NodeWithScore], input_length: int=20, max_valid_length: int=10, min_valid_length: int=5) -> List[NodeWithScore]:
     # 输入：检索结果列表，每个元素是 NodeWithScore。
-   # recall_result: list[NodeWithScore],
+    # recall_result: list[NodeWithScore],
 
     # 默认使用前 20 个检索结果进行 GMM 分组。
-   # input_length: int = 20,
+    # input_length: int = 20,
 
     # 默认最多保留 10 个结果。
-   # max_valid_length: int = 10,
+    # max_valid_length: int = 10,
 
     # 默认希望至少保留 5 个结果。
-   # min_valid_length: int = 5,
-) -> List[NodeWithScore]:  # 返回：筛选后的节点列表。
+    # min_valid_length: int = 5,
+    #-> List[NodeWithScore]:  # 返回：筛选后的节点列表。
     scores = [node.score for node in recall_result[:input_length]]
     
     scores = np.array(scores)
