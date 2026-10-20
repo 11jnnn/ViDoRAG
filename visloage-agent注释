@@ -1,0 +1,416 @@
+# 本文件负责候选页面上的多轮选页、证据检查和答案生成。
+# 全库检索及 GMM 筛选由外部完成；run_agent() 接收已经检索出的图片路径列表。
+# 三个 Agent 共用传入的 vlm，通过不同的提示词、页面集合和状态承担不同任务。
+# 阅读时重点区分两个同名缓存：
+# Seeker.buffer_images：尚未被 Seeker 选中过的候选页面。
+# Inspector.buffer_images：目前保留下来的证据页面。
+# 本文件的中文说明只增加注释，原有代码与执行逻辑保持不变。
+
+# 导入 Pillow 的图片类；当前文件没有直接使用，实际拼图由辅助函数完成。
+from PIL import Image
+# 导入操作系统工具；当前文件没有直接使用此导入。
+import os
+# 导入 JSON 工具；当前文件通过 extract_json() 完成解析，没有直接使用此导入。
+import json
+# 导入解释器相关工具；当前文件没有直接使用此导入。
+import sys
+
+# 导入三个字符串模板：选页提示词、证据检查提示词、最终回答提示词。
+from agent.agent_prompt import seeker_prompt,inspector_prompt,answer_prompt
+# arrangement_map_dict 按图片数量选择网格排列；另两个字典提供页面编号说明。
+# page_map_dict_normal 用于独立多图，page_map_dict 用于一张拼图中的多个页面。
+from agent.map_dict import arrangement_map_dict,page_map_dict_normal,page_map_dict
+
+# 把模型回复中的 JSON 文本解析成 Python 对象，正常情况下得到字典。
+from utils.parse_tool import extract_json
+# 将图片路径对应的页面拼成一张 PIL 图片；本文件没有传入 bbox 坐标。
+from utils.image_preprosser import concat_images_with_bbox
+
+# Seeker：从剩余候选页面中选出可能有用的页面，并记录剩余候选。
+class Seeker:
+    # 创建 Seeker 时自动执行；vlm 是外部创建好的视觉语言模型对象。
+    def __init__(self, vlm):
+        # 保存模型，后面通过 self.vlm.generate() 发起推理。
+        self.vlm = vlm
+        # False 表示把多个页面先拼成一张大图；True 表示输入多张独立图片。
+        self.seeker_multi_image = False
+
+        # 根据初始化时选定的图片输入方式，选择对应的编号说明。
+        if self.seeker_multi_image:
+            # 独立多图：提示模型按输入列表顺序识别第 0、1、2……张图片。
+            self.page_map = page_map_dict_normal
+        # 默认进入拼图分支。
+        else:
+            # 拼图：提示模型按网格位置识别各页，例如左上为 0、右上为 1。
+            self.page_map = page_map_dict
+    # 首次调用传 query 和 images_path；后续调用传 Inspector 给出的 feedback。
+    # 返回 (selected_images, summary, reason)：选中图片路径、相关信息摘要、选页理由。
+    def run(self, query=None, images_path=None, feedback=None):
+
+        # 问题和图片列表都已提供时，建立本次任务的初始状态。
+        # 这里检查的是 None，空列表 [] 仍然会进入此分支。
+        if query is not None and images_path is not None:
+            # 保存完整候选池；这里先引用传入列表，后续筛选时再生成新列表。
+            self.buffer_images = images_path
+            # 保存原始问题，收到反馈后仍然能够围绕原问题继续选页。
+            self.query = query
+            # 依次填入问题和页面编号说明；len(...) 用于按当前页面数量查字典。
+            # 配套编号字典只支持 1～20 页，0 页或超过 20 页会在此处查找失败。
+            prompt = seeker_prompt.replace('{question}', self.query).replace('{page_map}', self.page_map[len(self.buffer_images)])
+        
+        # 后续轮次只提供反馈，继续使用上次保存的原问题和剩余候选池。
+        elif feedback is not None:
+            # 将原问题与本轮缺失信息拼接；\n\n 表示两个换行。
+            # 每轮使用当前 feedback，这里没有自动拼接全部历史反馈。
+            additional_information = self.query + '\n\n## Additional Information\n' + feedback
+            # 填入带反馈的问题，并按剩余候选数量重新生成页面编号说明。
+            # 页面下标指向当前 buffer_images，候选池变动后编号也会随之变化。
+            prompt = seeker_prompt.replace('{question}', additional_information).replace('{page_map}', self.page_map[len(self.buffer_images)])        
+
+        # 选择实际交给模型的图片形式。
+        if self.seeker_multi_image:
+            # 多图方式直接使用剩余候选的图片路径列表。
+            input_images = self.buffer_images
+        # 默认采用拼图方式。
+        else:
+            # 按图片数量选择网格，例如 4 页为 2×2；scale=1 表示不额外整体缩放。
+            # line_width=40 表示页面之间的间隔宽度；外层 [] 把一张 PIL 图包装成列表。
+            input_images = [concat_images_with_bbox(self.buffer_images, arrangement=arrangement_map_dict[len(self.buffer_images)], scale=1, line_width=40)]
+
+        # 记录本次选页的尝试次数；它与外层 Agent 推理轮数是不同的计数。
+        times = 0
+        # 重复请求和解析输出，直到成功，或达到下面的次数限制。
+        while True:
+            # 计数为 0、1、2 时仍可发起请求，计数达到 3 后停止，最多请求三次。
+            if times > 2:
+                # 下行是原作者保留的失败返回方案，处于注释中，不会执行。
+                # return None, None, None
+                # 向调用方抛出异常；这里限制的是次数，没有实际计算耗时。
+                raise Exception('seeker time out')
+            # 在模型调用前将本次尝试计入计数器。
+            times += 1
+            # 输入提示词和图片，得到模型生成的原始回复文本。
+            # 此调用在 try 外；调用本身报错时，不会进入下面的 JSON 解析重试。
+            select_response = self.vlm.generate(query=prompt, image=input_images)
+            # 打印原始输出，便于检查选页结果及格式。
+            print(select_response)
+            # 捕获下面的解析、字段检查及页面处理异常。
+            try:
+                # 去除回复中包裹 JSON 的文本并解析；后面按字典读取字段。
+                select_response_json = extract_json(select_response)
+                # 获取选页理由；字段缺失时默认返回 None。
+                reason = select_response_json.get('reason', None)
+                # 获取与问题相关的信息摘要；字段缺失时返回 None。
+                summary = select_response_json.get('summary', None)
+                # 获取选中页面的下标列表，例如 [0, 2]，对应当前候选池。
+                select_page_num = select_response_json.get('choice', None)
+                # or 表示任一条件成立即失败；any(...) 检查是否至少有一个下标过大。
+                # [] 允许不选页；None 无法遍历，会报错并进入重试。
+                # 当前校验没有排除负数、重复下标，也没有显式检查下标类型。
+                if reason is None or summary is None or any([page >= len(self.buffer_images) for page in select_page_num]):
+                    # 抛出格式错误，并把候选池长度加入错误信息，便于调试。
+                    raise Exception(f'select json format error: length: {len(self.buffer_images)}')
+
+                # 按模型选择的下标取图；例如候选 [A,B,C,D] 和下标 [0,2] 得到 [A,C]。
+                selected_images = [self.buffer_images[page] for page in select_page_num]
+                # 将选中的图片从候选池移除；上例的剩余候选变为 [B,D]。
+                # 按图片路径是否入选进行过滤，同路径的重复项也会一起移除。
+                self.buffer_images = [image for image in self.buffer_images if image not in selected_images]
+
+            # 解析、字段检查或列表处理出错时，保存异常对象到 e。
+            except Exception as e:
+                # 打印错误原因。
+                print(e)
+                # 打印造成错误的模型输出。
+                print(select_response)
+                # 打印阶段名称，方便定位错误发生在哪个 Agent。
+                print('seeker')
+                # 回到重试循环开头，继续使用同一提示词和图片尝试。
+                continue
+            # 没有异常时结束本次重试循环，继续执行下面的返回语句。
+            break
+        
+        # 返回选中图片、摘要和理由；当前总调度器接收后只继续使用图片。
+        return selected_images, summary, reason
+
+# Inspector：把新选页面与保留的旧证据一起检查，决定回答、综合回答或继续选页。
+class Inspector:
+    # 初始化检查器；传入的 vlm 与其他 Agent 使用的是同一个模型对象。
+    def __init__(self, vlm):
+        # 保存模型，供证据检查时调用。
+        self.vlm = vlm
+        # 默认把证据页拼成一张图，再让模型检查。
+        self.inspector_multi_image = False
+
+        # 选择与图片输入方式一致的编号说明。
+        if self.inspector_multi_image:
+            # 多张独立图片使用按输入顺序编号的说明。
+            self.page_map = page_map_dict_normal
+        # 默认进入拼图分支。
+        else:
+            # 拼图使用按网格位置编号的说明。
+            self.page_map = page_map_dict
+
+        # 保存当前保留下来的证据页；每道新问题开始时，总调度器会清空它。
+        self.buffer_images = []
+
+    # query 为原问题，images_path 为 Seeker 本轮新选出的图片路径列表。
+    # 返回 (status, information, images)，中间一项的含义由 status 决定：
+    # answer：information 是答案，images 是当前证据。
+    # synthesizer：information 是候选答案或 None，images 是最终参考页。
+    # seeker：information 是缺失信息说明，images 是保留的证据。
+    def run(self, query, images_path):
+        # 下行原注释概括两种任务：给出答案，或给出反馈以继续收集证据。
+        # answer or not, (images, candidate)/feedback
+        # 如果既没有历史证据，也没有本轮新页，直接返回空结果。
+        if len(self.buffer_images) == 0 and len(images_path) == 0:
+            # 三个空值会让总调度器进入兜底分支并返回 None。
+            return None, None, None
+        # 前一分支已经排除了旧证据也为空的情况，因此这里表示仍有旧证据。
+        elif len(images_path) == 0:
+            # 本轮没有新页时，直接用已有证据尝试综合回答；此时没有候选答案。
+            # 这个分支没有再次请求 Inspector 判断证据是否已经充分。
+            return 'synthesizer', None, self.buffer_images
+        # 收到新页时，把它们加入当前证据集合。
+        elif len(images_path) != 0:
+            # extend 逐项追加：[A] 加 [C,D] 得到 [A,C,D]，不会形成嵌套列表。
+            self.buffer_images.extend(images_path)
+
+        # 决定如何将全部新旧证据交给模型。
+        if self.inspector_multi_image:
+            # 独立多图方式直接使用证据图片路径列表。
+            input_images = self.buffer_images
+        # 默认采用拼图。
+        else:
+            # 将全部当前证据拼接；页面编号对应本次 buffer_images 中的位置。
+            # 配套排列字典只支持 1～20 页，超出范围会在此处查找失败。
+            input_images = [concat_images_with_bbox(self.buffer_images, arrangement=arrangement_map_dict[len(self.buffer_images)], scale=1, line_width=40)]
+
+        # 把原问题和当前证据页编号说明填入证据检查提示词。
+        # Seeker 返回的 summary 和 reason 没有通过这个接口传入 Inspector。
+        prompt = inspector_prompt.replace('{question}',query).replace('{page_map}',self.page_map[len(self.buffer_images)])
+
+        # 本次证据检查的输出格式重试计数器。
+        times = 0
+        # 反复生成和解析结果；成功的分支会直接 return。
+        # JSON 合法但字段组合未匹配任何返回分支时，也会自然进入下一轮。
+        while True:
+            # 与 Seeker 相同，最多发起三次模型请求。
+            if times >2:
+                # 超过次数后向调用方抛出异常；没有实际的耗时检查。
+                raise Exception('Inspector time out')
+                # 下行是原作者注释掉的返回方案，不参与执行。
+                # return None, None, None
+            # 为即将发起的请求计数。
+            times +=1
+
+            # 调用模型检查当前证据；该调用在 try 外，调用异常会直接向上传播。
+            response = self.vlm.generate(query=prompt,image=input_images)
+            # 打印本轮证据检查的原始回复。
+            print(response)
+            # 捕获 JSON 解析、字段检查、页面下标处理时产生的异常。
+            try:
+                # 将回复文本解析成 Python 对象，正常情况下为字典。
+                response_json = extract_json(response)
+                # 下行原注释标记模型给出的检查或解题理由。
+                # thought
+                # 两种输出模式都要求提供 reason，缺失时返回 None。
+                reason = response_json.get('reason',None)
+                # 下行原注释标记证据不足时使用的反馈字段。
+                # if feedback
+                # 缺失信息说明，例如“还需要 2023 年营业收入”。
+                info = response_json.get('information',None)
+                # 证据不足时，希望从当前缓存中保留的页面下标列表。
+                choice = response_json.get('choice',None)
+                # 下行原注释标记能够回答时使用的字段。
+                # can answer
+                # 模型基于当前证据生成的答案。
+                answer = response_json.get('answer',None)
+                # 支撑该答案的参考页下标，编号对应 Inspector 当前证据列表。
+                ref = response_json.get('reference',None)
+
+                # 先检查理由是否缺失；这里没有验证理由内容的正确性。
+                if reason is None:
+                    # 缺少理由时触发异常重试。
+                    raise Exception('answer no reason')
+                # 答案和参考页都存在时，按“模型认为可以回答”处理。
+                # 是否充分由模型通过输出字段表达，代码没有另算充分性分数。
+                elif answer is not None and ref is not None:
+                    # 引用必须非空，且不能有大于等于证据数量的下标。
+                    # 这里仍没有排除负数、重复下标或显式校验下标类型。
+                    if any([page >= len(self.buffer_images) for page in ref]) or len(ref)==0:
+                        # 引用检查失败，进入异常重试。
+                        raise Exception('ref error')
+                    # 仅比较引用数量与证据数量；没有检查引用去重后的覆盖范围。
+                    if len(ref) == len(self.buffer_images):
+                        # 直接交出 Inspector 的答案，总调度器无需再调用 Synthesizer。
+                        return 'answer', answer, self.buffer_images
+                    # 引用数量与缓存数量不同，准备从缓存中提取参考页。
+                    else:
+                        # 例如缓存 [A,B,C]、引用 [0,2]，提取出的参考页为 [A,C]。
+                        ref_images = [self.buffer_images[page] for page in ref]
+                        # 交给 Synthesizer，用这些参考页及候选答案再生成最终回答。
+                        return 'synthesizer', answer, ref_images
+                # 没有进入回答分支，且反馈和保留页列表都存在时，继续寻找证据。
+                elif info is not None and choice is not None:
+                    # 检查要保留的页面下标是否超过当前证据列表范围。
+                    if any([page >= len(self.buffer_images) for page in choice]):
+                        # 保留页下标错误，触发异常重试。
+                        raise Exception('choice error')
+                    # 只保留 choice 指定的证据，顺序与 choice 一致；[] 会清空证据。
+                    # 被丢弃页面不会自动放回 Seeker 的剩余候选池。
+                    self.buffer_images = [self.buffer_images[page] for page in choice]
+                    # 返回缺失信息，让总调度器指导 Seeker 进行下一轮选页。
+                    return 'seeker', info, self.buffer_images
+            
+            # 捕获前面解析与检查过程中的异常。
+            except Exception as e:
+                # 打印具体错误。
+                print(e)
+                # 标记错误来自 Inspector。
+                print("inspector")
+                # 捕获异常后回到循环开头重试，仍受本次最多三次请求的限制。
+                continue
+
+# Synthesizer：根据最终参考页面和可选的候选答案，生成最终回答。
+class Synthesizer:
+    # 创建最终回答器，并接收共用的视觉语言模型对象。
+    def __init__(self, vlm):
+        # 保存模型，供最终回答时调用。
+        self.vlm = vlm
+        # 默认把参考页拼接成单张图片。
+        self.synthesizer_multi_image = False
+        # 选择匹配当前图片输入方式的编号说明。
+        if self.synthesizer_multi_image:
+            # 多张独立图片按输入列表顺序编号。
+            self.page_map = page_map_dict_normal
+        # 默认进入拼图分支。
+        else:
+            # 拼图根据网格位置说明每个页面的编号。
+            self.page_map = page_map_dict
+
+    # 输入：原问题 query、候选答案 candidate_answer、最终参考图片 ref_images。
+    # candidate_answer 可以是 None；返回 (reason, answer)，即最终理由和答案。
+    def run(self, query, candidate_answer, ref_images):
+        # Inspector 可能已经生成候选答案，也可能只交出已有证据。
+        if candidate_answer is not None:
+            # 把候选答案作为相关信息追加到原问题，供模型结合图片再检查和作答。
+            # 这里重新赋值局部变量 query，原始字符串本身不会被原地修改。
+            query = query + '\n\n## Related Information\n' + candidate_answer
+        # 填入最终问题描述，并按照最终参考页数量生成页面编号说明。
+        prompt = answer_prompt.replace('{question}',query).replace('{page_map}',self.page_map[len(ref_images)])
+
+        # 根据输入方式准备最终参考图片。
+        if self.synthesizer_multi_image:
+            # 独立多图：直接使用参考图片路径列表。
+            input_images = ref_images
+        # 默认使用拼图。
+        else:
+            # 将参考页拼成一张 PIL 图片并放进列表；图片间隔为 40 像素。
+            # 参考页经过筛选后会重新按当前列表编号，不能沿用此前证据列表的下标。
+            input_images = [concat_images_with_bbox(ref_images, arrangement=arrangement_map_dict[len(ref_images)], scale=1, line_width=40)]
+        
+        # 持续尝试生成可解析的回答；原实现没有为这个循环设置重试次数上限。
+        while True:
+            # 让模型根据问题描述及最终参考页生成回答。
+            # 模型调用在 try 外，调用本身的异常会直接传给上层。
+            final_answer_response = self.vlm.generate(query=prompt,image=input_images)
+            # 打印模型原始输出，便于检查最终回答。
+            print(final_answer_response)
+            # 捕获 JSON 解析和必需字段检查过程中产生的异常。
+            try:
+                # 将最终回答文本解析为 Python 对象，正常情况下为字典。
+                final_answer_response_json = extract_json(final_answer_response)
+                # 提取模型给出的最终理由。
+                reason = final_answer_response_json.get('reason',None)
+                # 提取最终答案；当前函数没有读取提示词中还要求的 reference 字段。
+                answer = final_answer_response_json.get('answer',None)
+                # 任意一个必需字段为 None，就认为输出不符合要求。
+                if reason is None or answer is None :
+                    # 异常名称含 time out，但这里实际表示字段缺失，没有进行计时。
+                    raise Exception('Synthesizer time out')
+                # 输出符合要求，返回理由和答案，同时结束循环。
+                return reason, answer
+            # 解析或字段检查失败时，进入下面的重试处理。
+            except Exception as e:
+                # 打印具体错误。
+                print(e)
+                # 打印导致错误的模型输出。
+                print(final_answer_response)
+                # 标记错误发生在最终回答阶段。
+                print("answer")
+                # 再次请求模型；如果回复一直不符合要求，循环可能一直持续。
+                continue
+
+# 总调度器：依次调用 Seeker、Inspector，并根据检查结果决定是否使用 Synthesizer。
+class ViDoRAG_Agents:
+    # 接收已经创建好的模型，构建三个职责不同的 Agent。
+    def __init__(self, vlm):
+        # 创建负责从剩余候选池中选页的 Seeker。
+        self.seeker = Seeker(vlm)
+        # 创建负责保留证据、判断是否充分并生成反馈的 Inspector。
+        self.inspector = Inspector(vlm)
+        # 创建负责基于最终参考页生成答案的 Synthesizer。
+        # 三者使用同一个 vlm 对象，调用顺序由下面的 run_agent() 控制。
+        self.synthesizer = Synthesizer(vlm)
+
+    # 整个多 Agent 流程的入口；images_path 为外部检索后传入的候选图片路径列表。
+    # 返回最终答案；没有可用证据时返回 None。模型或重试异常可能向调用方传播。
+    def run_agent(self, query, images_path):
+        # 下行原注释表示开始初始化本次问题的状态。
+        # initial
+        # 重置 Seeker 缓存；首次 run() 随后会用本次 images_path 覆盖它。
+        self.seeker.buffer_images = None
+        # 清空上一道题的证据，防止不同问题的页面混在一起。
+        self.inspector.buffer_images = []
+
+        # 首轮选页：同时传原问题和完整候选池，再接收三个返回值。
+        # summary 和 reason 虽然被接收，但后续没有继续传给 Inspector 或用于控制流程。
+        selected_images, summary, reason = self.seeker.run(query=query, images_path=images_path)
+        # 下行原注释表示开始多轮推理。
+        # iter
+        # 外层循环没有显式轮数上限；在初始候选池中持续选页、检查。
+        # 此处没有调用全库检索，候选池由 Seeker 保存并在每次选页后缩小。
+        while True:
+            # 检查本轮新选页面；Inspector 内部会将它们与保留的旧证据合并。
+            # 三个返回值依次是状态、该状态携带的信息、该状态对应的图片。
+            status, information, images = self.inspector.run(query, selected_images)
+            # answer 状态下，information 装的是 Inspector 已经生成的答案。
+            if status == 'answer':
+                # 直接返回答案，结束整个流程。
+                return information
+            # synthesizer 状态下，需要基于最终参考页生成一次最终答案。
+            elif status == 'synthesizer':
+                # information 是候选答案或 None，images 是最终参考页。
+                # Synthesizer 返回的理由被接收，但调用方最终只得到答案。
+                reason, answer = self.synthesizer.run(query, information, images)
+                # 返回最终回答并结束流程。
+                return answer
+            # seeker 状态表示还缺少信息，需要从剩余候选池中继续选页。
+            elif status == 'seeker':
+                # 只传最新反馈；Seeker 已保存原问题和剩余候选页面。
+                # Inspector 保留的旧证据仍在自己的缓存中，无需在这里重新传递。
+                selected_images, summary, reason = self.seeker.run(feedback=information)
+                # 回到循环开头，用本轮新选页面再次调用 Inspector。
+                continue
+            # 例如 Inspector 返回三个 None 时，会进入此兜底分支。
+            else:
+                # 打印没有相关信息的提示。
+                print('No related information')
+                # 返回空结果并结束本次问题。
+                return None
+
+# 只有直接执行本文件时才运行下方示例；其他文件导入本模块时不会执行示例。
+if __name__ == '__main__':
+    # 导入项目的模型封装，由它连接实际的视觉语言模型后端。
+    from llms.llm import LLM
+    # 创建示例模型对象；当前配套 llms/llm.py 没有 qwen-vl-max 的调用分支。
+    # 实际运行需先配置受支持的后端；这里保留原示例的模型名与原有行为。
+    vlm = LLM('qwen-vl-max')
+    # 构建总调度器，并在内部创建三个共用该模型的 Agent。
+    agent = ViDoRAG_Agents(vlm)
+    # 用示例问题和四张图片直接运行流程，将最终答案保存到 re。
+    # 这四张图片由示例直接给定；该语句没有执行检索。
+    re=agent.run_agent(query='Who is Tim?', images_path=['./data/ExampleDataset/img/00a76e3a9a36255616e2dc14a6eb5dde598b321f_1.jpg','./data/ExampleDataset/img/00a76e3a9a36255616e2dc14a6eb5dde598b321f_2.jpg','./data/ExampleDataset/img/00a76e3a9a36255616e2dc14a6eb5dde598b321f_3.jpg','./data/ExampleDataset/img/00a76e3a9a36255616e2dc14a6eb5dde598b321f_4.jpg'])
+    # 打印最终答案；如果流程返回空结果，则打印 None。
+    print(re)
