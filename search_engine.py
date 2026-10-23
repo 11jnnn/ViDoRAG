@@ -243,7 +243,15 @@ class SearchEngine:
             json.dump(results, json_file, indent=2, ensure_ascii=False)
 
 class HybridSearchEngine:
-    
+dataset数据集名称
+node_dir_prefix_vl视觉向量资源所在的子目录
+node_dir_prefix_text文本向量资源所在的子目录
+embed_model_name_vl视觉检索模型，默认 ColQwen2
+embed_model_name_text文本检索模型，默认 BGE-M3
+topk控制每路 GMM 的最大保留数量等
+gmm保存一个配置开关，但当前实际执行分支没有使用这个开关来决定是否运行 GMM
+
+
     def __init__(self,
                  dataset,
                  node_dir_prefix_vl = None,
@@ -255,7 +263,11 @@ class HybridSearchEngine:
         self.dataset = dataset
         self.dataset_dir = os.path.join('./data', dataset)
         self.img_dir = os.path.join(self.dataset_dir, 'img')
-        self.ppocr_dir = os.path.join(self.dataset_dir, 'bge_ingestion')
+#  已经过文本向量化处理的 Node 文件目录
+        self.ppocr_dir = os.path.join(self.dataset_dir, 'bge_ingestion'
+
+# 视觉检索器：查询文本与页面图片向量匹配
+# 文本检索器：查询文本与 OCR 文本向量匹配
         self.engine_vl = SearchEngine(dataset,node_dir_prefix=node_dir_prefix_vl,embed_model_name=embed_model_name_vl)
         self.engine_text = SearchEngine(dataset,node_dir_prefix=node_dir_prefix_text,embed_model_name=embed_model_name_text)
         self.topk = topk
