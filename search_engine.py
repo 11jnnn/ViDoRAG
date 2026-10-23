@@ -193,15 +193,34 @@ class SearchEngine:
         vector_retriever = vector_index.as_retriever(similarity_top_k=self.recall_num)
         return vector_retriever
     
+
     def search(self, query):
+    # 同时满足以下两个条件，才进入这个分支：
+    # ① self.vl_ret=True：当前被配置为视觉资源检索；
+    # ② 模型名称包含 vidore，例如 ColQwen、ColPali。
         if self.vl_ret and 'vidore' in self.embed_model_name:
+        # 将问题文本编码成查询多向量。
+        # 注意：这里只编码当前问题，不会重新编码所有页面。
             query_embedding = self.vector_embed_model.embed_text(query)
+        # 比较问题多向量与已经加载的全部页面多向量。
+        # ColPali / ColQwen 使用 MaxSim 类晚交互打分。
+        # 单个问题时，scores 通常形如 [1, 页面总数]。
             scores = self.vector_embed_model.processor.score(query_embedding,self.embedding_img)
+        # scores[0]：第一个，也是当前唯一一个问题的页面分数。
+        # numel()：统计分数个数，也就是参与匹配的页面数量。
+        # 最多召回100页；如果不足100页，就取实际页面数
             k = min(100, scores[0].numel())
+       # 找到分数最高的k项，默认按分数从高到低排列。
+        # values：这些结果的分数。
+        # indices：这些结果在页面向量列表中的下标。
             values, indices = torch.topk(scores[0], k=k)
+       # 根据下标，从self.nodes中取出对应的页面节点。
+        # 这里取到的是已有对象的引用，没有复制出全新的节点。
             recall_results = [self.nodes[i] for i in indices]
             for node in recall_results:
                 node.embedding = None
+       # 把每个页面节点与对应分数配对，
+        # 形成“带分数的节点对象列表”。
             recall_results = [NodeWithScore(node=node, score=score) for node, score in zip(recall_results, values)]
             recall_results_output = recall_results
         else:
@@ -218,6 +237,22 @@ class SearchEngine:
             target_length = min([num for num in candidate_length if num > current_length])
             recall_results_output = recall_results[:target_length]
         return nodes2dict(recall_results_output)
+
+##{
+    "response": None,
+
+    "source_nodes": [
+        {
+            "node": {
+                # 节点内容、路径、元数据等
+            },
+            "score": 分数或None
+        },
+        ...
+    ],
+
+    "metadata": None
+}##
     
     def search_example(self,example):
         query = example['query']
