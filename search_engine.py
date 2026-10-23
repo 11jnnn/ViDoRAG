@@ -46,7 +46,7 @@ def gmm(recall_result: list[NodeWithScore], input_length: int=20, max_valid_leng
     #M 步：用这些概率作为权重，重新计算两个分布的均值、方差和占比。
     #反复迭代：重复 E 步和 M 步，直到拟合基本稳定，或达到最大迭代次数。
     #保存参数：将结果保存到 gmm 对象中，供后续分类使用。
-    #gmm = GaussianMixture(n_components=2, n_init=1, random_state=0)
+    gmm = GaussianMixture(n_components=2, n_init=1, random_state=0)
 
     # 根据输入分数，学习两个高斯分布的参数。
     gmm.fit(scores)
