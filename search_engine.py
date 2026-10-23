@@ -193,7 +193,11 @@ class SearchEngine:
         vector_retriever = vector_index.as_retriever(similarity_top_k=self.recall_num)
         return vector_retriever
     
-
+##SearchEngine 的单路检索入口。它根据当前模型与配置，完成四件事：
+   ##计算问题与节点的相关性，得到召回结果。
+   ##根据配置，使用 GMM 筛选结果。
+   ##根据配置，调整返回结果的数量。
+   ##返回对象列表或字典。
     def search(self, query):
     # 同时满足以下两个条件，才进入这个分支：
     # ① self.vl_ret=True：当前被配置为视觉资源检索；
